@@ -91,6 +91,7 @@ class DouyinAPIClient:
 
     async def _ensure_session(self):
         if self._session is None or self._session.closed:
+            await self._ensure_ttwid()
             self._session = aiohttp.ClientSession(
                 headers=self.headers,
                 cookies=self.cookies,
@@ -122,6 +123,35 @@ class DouyinAPIClient:
             if self._session and not self._session.closed:
                 self._session.cookie_jar.update_cookies({"msToken": self._ms_token})
         return self._ms_token
+
+    _TTWID_REGISTER_URL = "https://ttwid.bytedance.com/ttwid/union/register/"
+    _TTWID_PAYLOAD = (
+        '{"region":"cn","aid":1768,"needFid":false,'
+        '"service":"www.ixigua.com",'
+        '"migrate_info":{"ticket":"","source":"node"},'
+        '"cbUrlProtocol":"https","union":true}'
+    )
+
+    async def _ensure_ttwid(self) -> None:
+        """Auto-generate ttwid cookie if not provided by user."""
+        if self.cookies.get("ttwid"):
+            return
+        try:
+            async with aiohttp.ClientSession() as tmp:
+                async with tmp.post(
+                    self._TTWID_REGISTER_URL,
+                    data=self._TTWID_PAYLOAD,
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    for sc in resp.headers.getall("Set-Cookie", []):
+                        if sc.startswith("ttwid="):
+                            value = sc.split("=", 1)[1].split(";")[0]
+                            self.cookies["ttwid"] = value
+                            logger.info("Auto-generated ttwid cookie")
+                            return
+        except Exception as exc:
+            logger.warning("Failed to auto-generate ttwid: %s", exc)
 
     async def _default_query(self) -> Dict[str, Any]:
         ms_token = await self._ensure_ms_token()
