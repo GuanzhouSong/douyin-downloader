@@ -299,6 +299,16 @@ async def _resolve_media_urls(
         if cover_url:
             result["cover_url"] = cover_url
 
+        # Include recommended headers for downloading from CDN
+        result["download_headers"] = {
+            "Referer": "https://www.douyin.com/",
+            "User-Agent": (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 "
+                "Mobile/15E148 Safari/604.1"
+            ),
+        }
+
         return result
 
 
