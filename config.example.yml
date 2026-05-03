@@ -93,6 +93,7 @@ notifications:
 
 # REST API 服务模式（可选，需额外安装 fastapi + uvicorn）
 server:
+  api_key: ""            # API 密钥，留空则不启用鉴权（也可设环境变量 DOUYIN_API_KEY）
   max_jobs: 500
   job_ttl_seconds: 86400   # 完成态 job 保留 24 小时
 

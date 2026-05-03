@@ -4,7 +4,9 @@
 """
 
 import asyncio
+import os
 from typing import Any, Dict
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -178,3 +180,223 @@ async def test_job_manager_prunes_by_ttl():
     remaining_ids = {j.job_id for j in await manager.list_jobs()}
     assert old_job.job_id not in remaining_ids
     assert new_job.job_id in remaining_ids
+
+
+# --- API key auth tests ---
+
+
+def test_api_key_blocks_unauthenticated(tmp_path):
+    """Requests without valid API key should get 401."""
+    config = ConfigLoader(None)
+    config.update(path=str(tmp_path))
+    config.config.setdefault("server", {})["api_key"] = "test-secret-key"
+    app = build_app(config)
+
+    with TestClient(app) as client:
+        # No auth header
+        resp = client.post(
+            "/api/v1/download", json={"url": "https://www.douyin.com/video/123"}
+        )
+        assert resp.status_code == 401
+        assert resp.json()["detail"] == "unauthorized"
+
+        # Wrong token
+        resp = client.post(
+            "/api/v1/download",
+            json={"url": "https://www.douyin.com/video/123"},
+            headers={"Authorization": "Bearer wrong-key"},
+        )
+        assert resp.status_code == 401
+
+
+def test_api_key_allows_authenticated(tmp_path):
+    """Requests with valid API key should pass through."""
+    config = ConfigLoader(None)
+    config.update(path=str(tmp_path))
+    config.config.setdefault("server", {})["api_key"] = "test-secret-key"
+    app = build_app(config)
+
+    async def fake_executor(url: str) -> Dict[str, int]:
+        return {"total": 0, "success": 0, "failed": 0, "skipped": 0}
+
+    app.state.job_manager.executor = fake_executor
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/api/v1/download",
+            json={"url": "https://www.douyin.com/video/123"},
+            headers={"Authorization": "Bearer test-secret-key"},
+        )
+        assert resp.status_code == 200
+
+
+def test_api_key_health_always_public(tmp_path):
+    """Health endpoint should be accessible without auth even when API key is set."""
+    config = ConfigLoader(None)
+    config.update(path=str(tmp_path))
+    config.config.setdefault("server", {})["api_key"] = "test-secret-key"
+    app = build_app(config)
+
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/health")
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "ok"}
+
+
+def test_no_api_key_skips_auth(tmp_path):
+    """When no API key is configured, all requests should pass through."""
+    config = ConfigLoader(None)
+    config.update(path=str(tmp_path))
+    app = build_app(config)
+
+    async def fake_executor(url: str) -> Dict[str, int]:
+        return {"total": 0, "success": 0, "failed": 0, "skipped": 0}
+
+    app.state.job_manager.executor = fake_executor
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/api/v1/download", json={"url": "https://www.douyin.com/video/123"}
+        )
+        assert resp.status_code == 200
+
+
+def test_api_key_from_env(tmp_path, monkeypatch):
+    """API key should be loadable from DOUYIN_API_KEY env var."""
+    config = ConfigLoader(None)
+    config.update(path=str(tmp_path))
+    monkeypatch.setenv("DOUYIN_API_KEY", "env-key-123")
+    app = build_app(config)
+
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/health")
+        assert resp.status_code == 200
+
+        resp = client.post(
+            "/api/v1/download", json={"url": "https://www.douyin.com/video/1"}
+        )
+        assert resp.status_code == 401
+
+        resp = client.post(
+            "/api/v1/download",
+            json={"url": "https://www.douyin.com/video/1"},
+            headers={"Authorization": "Bearer env-key-123"},
+        )
+        # Should pass auth (may fail on download but not 401)
+        assert resp.status_code != 401
+
+
+# --- Resolve endpoint tests ---
+
+
+def test_resolve_rejects_empty_url(tmp_path):
+    config = ConfigLoader(None)
+    config.update(path=str(tmp_path))
+    app = build_app(config)
+    with TestClient(app) as client:
+        resp = client.post("/api/v1/resolve", json={"url": ""})
+        assert resp.status_code == 400
+
+
+@patch("server.app._resolve_media_urls")
+def test_resolve_returns_video_url(mock_resolve, tmp_path):
+    mock_resolve.return_value = {
+        "media_type": "video",
+        "aweme_id": "7000000000000000001",
+        "description": "test video",
+        "author": "test_user",
+        "urls": [{"url": "https://cdn.example.com/video.mp4", "type": "video"}],
+        "cover_url": "https://cdn.example.com/cover.jpg",
+    }
+
+    config = ConfigLoader(None)
+    config.update(path=str(tmp_path))
+    app = build_app(config)
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/api/v1/resolve",
+            json={"url": "https://www.douyin.com/video/7000000000000000001"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "success"
+        assert data["media_type"] == "video"
+        assert len(data["urls"]) == 1
+        assert data["urls"][0]["type"] == "video"
+        assert data["urls"][0]["url"].startswith("https://")
+
+
+@patch("server.app._resolve_media_urls")
+def test_resolve_returns_gallery_urls(mock_resolve, tmp_path):
+    mock_resolve.return_value = {
+        "media_type": "gallery",
+        "aweme_id": "7000000000000000002",
+        "description": "test gallery",
+        "author": "test_user",
+        "urls": [
+            {"url": "https://cdn.example.com/img1.jpg", "type": "image"},
+            {"url": "https://cdn.example.com/img2.jpg", "type": "image"},
+        ],
+    }
+
+    config = ConfigLoader(None)
+    config.update(path=str(tmp_path))
+    app = build_app(config)
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/api/v1/resolve",
+            json={"url": "https://www.douyin.com/note/7000000000000000002"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "success"
+        assert data["media_type"] == "gallery"
+        assert len(data["urls"]) == 2
+
+
+@patch("server.app._resolve_media_urls")
+def test_resolve_handles_error(mock_resolve, tmp_path):
+    mock_resolve.side_effect = RuntimeError("Failed to resolve short URL: x")
+
+    config = ConfigLoader(None)
+    config.update(path=str(tmp_path))
+    app = build_app(config)
+
+    with TestClient(app) as client:
+        resp = client.post("/api/v1/resolve", json={"url": "https://bad-url"})
+        assert resp.status_code == 422
+        assert "Failed to resolve" in resp.json()["detail"]
+
+
+@patch("server.app._resolve_media_urls")
+def test_resolve_with_api_key(mock_resolve, tmp_path):
+    """Resolve endpoint should require API key when configured."""
+    mock_resolve.return_value = {
+        "media_type": "video",
+        "aweme_id": "123",
+        "description": "test",
+        "author": "user",
+        "urls": [{"url": "https://cdn.example.com/v.mp4", "type": "video"}],
+    }
+
+    config = ConfigLoader(None)
+    config.update(path=str(tmp_path))
+    config.config.setdefault("server", {})["api_key"] = "my-key"
+    app = build_app(config)
+
+    with TestClient(app) as client:
+        # Without auth
+        resp = client.post(
+            "/api/v1/resolve", json={"url": "https://www.douyin.com/video/123"}
+        )
+        assert resp.status_code == 401
+
+        # With auth
+        resp = client.post(
+            "/api/v1/resolve",
+            json={"url": "https://www.douyin.com/video/123"},
+            headers={"Authorization": "Bearer my-key"},
+        )
+        assert resp.status_code == 200

@@ -2,6 +2,7 @@
 
 HTTP 层薄封装：
 - 接收 URL，创建 job，返回 job_id
+- /resolve 端点：解析抖音链接，返回无水印直链（供 iPhone Shortcuts 使用）
 - 实际下载委托给 cli.main.download_url 的简化复用
 
 fastapi/uvicorn 是**可选**依赖。若未安装，导入本模块会 ImportError。
@@ -9,22 +10,32 @@ fastapi/uvicorn 是**可选**依赖。若未安装，导入本模块会 ImportEr
 
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from auth import CookieManager
 from config import ConfigLoader
 from control import QueueManager, RateLimiter, RetryHandler
 from core import DouyinAPIClient, URLParser, DownloaderFactory
+from core.downloader_base import BaseDownloader
 from server.jobs import JobManager
 from storage import FileManager
 from utils.logger import setup_logger
 from utils.validators import is_short_url, normalize_short_url
 
 logger = setup_logger("REST")
+
+# Gallery aweme_type values (mirrors BaseDownloader._GALLERY_AWEME_TYPES)
+_GALLERY_AWEME_TYPES = {2, 68, 150}
+
+# Paths that never require API key authentication
+_PUBLIC_PATHS = frozenset({"/api/v1/health", "/docs", "/openapi.json", "/redoc"})
 
 
 class DownloadRequest(BaseModel):
@@ -62,23 +73,247 @@ class _ServerDeps:
         )
 
 
-async def _execute_download(url: str, deps: "_ServerDeps") -> Dict[str, int]:
-    """简化版 download_url：只负责执行并返回成功/失败计数。
+def _get_api_key(config: ConfigLoader) -> Optional[str]:
+    """Resolve API key from config or environment."""
+    server_cfg = config.get("server") or {}
+    if isinstance(server_cfg, dict):
+        key = server_cfg.get("api_key")
+        if key:
+            return str(key)
+    return os.environ.get("DOUYIN_API_KEY") or None
 
-    有意不复用 cli.main.download_url —— 后者绑定了 progress_display 的 rich 状态。
-    API client 仍按请求创建（aiohttp session 不跨请求复用）；其余重量级依赖从
-    _ServerDeps 共享。
+
+def _detect_media_type(aweme_data: Dict[str, Any]) -> str:
+    """Detect whether aweme is a video or gallery."""
+    if (
+        aweme_data.get("image_post_info")
+        or aweme_data.get("images")
+        or aweme_data.get("image_list")
+    ):
+        return "gallery"
+    aweme_type = aweme_data.get("aweme_type")
+    if isinstance(aweme_type, int) and aweme_type in _GALLERY_AWEME_TYPES:
+        return "gallery"
+    return "video"
+
+
+def _extract_first_url(source: Any) -> Optional[str]:
+    """Extract the first URL from various Douyin API response structures."""
+    if isinstance(source, dict):
+        url_list = source.get("url_list")
+        if isinstance(url_list, list) and url_list:
+            first_item = url_list[0]
+            if isinstance(first_item, str) and first_item:
+                return first_item
+    elif isinstance(source, list) and source:
+        first_item = source[0]
+        if isinstance(first_item, str) and first_item:
+            return first_item
+    elif isinstance(source, str) and source:
+        return source
+    return None
+
+
+def _pick_first_media_url(*sources: Any) -> Optional[str]:
+    for source in sources:
+        candidate = _extract_first_url(source)
+        if candidate:
+            return candidate
+    return None
+
+
+def _pick_highest_quality_play_addr(
+    video: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Pick the highest bitrate play_addr from video.bit_rate list."""
+    bit_rates = video.get("bit_rate") if isinstance(video, dict) else None
+    if not isinstance(bit_rates, list) or not bit_rates:
+        return None
+    best = None  # type: Optional[Dict[str, Any]]
+    best_score = -1
+    for entry in bit_rates:
+        if not isinstance(entry, dict):
+            continue
+        play_addr = entry.get("play_addr")
+        if not isinstance(play_addr, dict):
+            continue
+        try:
+            bit_rate = int(entry.get("bit_rate") or 0)
+        except (TypeError, ValueError):
+            bit_rate = 0
+        width = int(play_addr.get("width") or entry.get("width") or 0)
+        score = bit_rate * 10_000 + width
+        if score > best_score:
+            best_score = score
+            best = play_addr
+    return best
+
+
+def _build_no_watermark_url(
+    aweme_data: Dict[str, Any], api_client: DouyinAPIClient
+) -> Optional[str]:
+    """Extract the best no-watermark video URL from aweme data."""
+    video = aweme_data.get("video", {})
+    play_addr = _pick_highest_quality_play_addr(video) or video.get(
+        "play_addr", {}
+    )
+    url_candidates = [c for c in (play_addr.get("url_list") or []) if c]
+    url_candidates.sort(key=lambda u: 0 if "watermark=0" in u else 1)
+
+    fallback_candidate = None  # type: Optional[str]
+
+    for candidate in url_candidates:
+        parsed = urlparse(candidate)
+        if parsed.netloc.endswith("douyin.com"):
+            if "X-Bogus=" not in candidate:
+                signed_url, _ua = api_client.sign_url(candidate)
+                return signed_url
+            return candidate
+        fallback_candidate = candidate
+
+    if fallback_candidate:
+        return fallback_candidate
+
+    uri = (
+        play_addr.get("uri")
+        or video.get("vid")
+        or video.get("download_addr", {}).get("uri")
+    )
+    if uri:
+        params = {
+            "video_id": uri,
+            "ratio": "1080p",
+            "line": "0",
+            "is_play_url": "1",
+            "watermark": "0",
+            "source": "PackSourceEnum_PUBLISH",
+        }
+        signed_url, _ua = api_client.build_signed_path("/aweme/v1/play/", params)
+        return signed_url
+
+    return None
+
+
+def _collect_image_urls(aweme_data: Dict[str, Any]) -> List[str]:
+    """Collect gallery image download URLs from aweme data."""
+    image_urls = []
+    image_post = aweme_data.get("image_post_info")
+    gallery_items = []  # type: List[Any]
+    if isinstance(image_post, dict):
+        for key in ("images", "image_list"):
+            candidate = image_post.get(key)
+            if isinstance(candidate, list) and candidate:
+                gallery_items = candidate
+                break
+    if not gallery_items:
+        images = aweme_data.get("images") or aweme_data.get("image_list") or []
+        if isinstance(images, list):
+            gallery_items = images
+
+    for item in gallery_items:
+        if not isinstance(item, dict):
+            continue
+        image_url = _pick_first_media_url(
+            item.get("download_url"),
+            item.get("download_addr"),
+            item.get("download_url_list"),
+            item,
+            item.get("display_image"),
+            item.get("owner_watermark_image"),
+        )
+        if image_url:
+            image_urls.append(image_url)
+
+    # Deduplicate
+    seen = set()  # type: set
+    deduped = []  # type: List[str]
+    for url in image_urls:
+        if url not in seen:
+            seen.add(url)
+            deduped.append(url)
+    return deduped
+
+
+async def _resolve_media_urls(
+    url: str, deps: _ServerDeps
+) -> Dict[str, Any]:
+    """Resolve a Douyin URL into direct no-watermark media URLs.
+
+    Returns media type, description, author info, and direct CDN URLs
+    without downloading any content.
     """
     async with DouyinAPIClient(deps.cookie_manager.get_cookies()) as api_client:
         if is_short_url(url):
             resolved = await api_client.resolve_short_url(normalize_short_url(url))
             if not resolved:
-                raise RuntimeError(f"Failed to resolve short URL: {url}")
+                raise RuntimeError("Failed to resolve short URL: %s" % url)
             url = resolved
 
         parsed = URLParser.parse(url)
         if not parsed:
-            raise RuntimeError(f"Unsupported URL: {url}")
+            raise RuntimeError("Unsupported URL: %s" % url)
+
+        url_type = parsed.get("type")
+        aweme_id = parsed.get("aweme_id") or parsed.get("note_id")
+        if not aweme_id:
+            raise RuntimeError("Could not extract content ID from URL: %s" % url)
+
+        aweme_data = await api_client.get_video_detail(aweme_id)
+        if not aweme_data:
+            raise RuntimeError("Failed to get content detail for: %s" % aweme_id)
+
+        media_type = _detect_media_type(aweme_data)
+        author = aweme_data.get("author", {})
+        desc = (aweme_data.get("desc", "") or "").strip()
+
+        result = {
+            "media_type": media_type,
+            "aweme_id": aweme_id,
+            "description": desc,
+            "author": author.get("nickname", ""),
+            "urls": [],
+        }  # type: Dict[str, Any]
+
+        if media_type == "video":
+            video_url = _build_no_watermark_url(aweme_data, api_client)
+            if video_url:
+                result["urls"] = [{"url": video_url, "type": "video"}]
+            else:
+                raise RuntimeError(
+                    "No playable video URL found for: %s" % aweme_id
+                )
+        elif media_type == "gallery":
+            image_urls = _collect_image_urls(aweme_data)
+            result["urls"] = [
+                {"url": u, "type": "image"} for u in image_urls
+            ]
+            if not image_urls:
+                raise RuntimeError(
+                    "No gallery images found for: %s" % aweme_id
+                )
+
+        # Include cover URL for convenience
+        cover_url = _extract_first_url(
+            aweme_data.get("video", {}).get("cover")
+        )
+        if cover_url:
+            result["cover_url"] = cover_url
+
+        return result
+
+
+async def _execute_download(url: str, deps: _ServerDeps) -> Dict[str, int]:
+    """Run download and return counts (used by async job endpoint)."""
+    async with DouyinAPIClient(deps.cookie_manager.get_cookies()) as api_client:
+        if is_short_url(url):
+            resolved = await api_client.resolve_short_url(normalize_short_url(url))
+            if not resolved:
+                raise RuntimeError("Failed to resolve short URL: %s" % url)
+            url = resolved
+
+        parsed = URLParser.parse(url)
+        if not parsed:
+            raise RuntimeError("Unsupported URL: %s" % url)
 
         downloader = DownloaderFactory.create(
             parsed["type"],
@@ -86,14 +321,14 @@ async def _execute_download(url: str, deps: "_ServerDeps") -> Dict[str, int]:
             api_client,
             deps.file_manager,
             deps.cookie_manager,
-            None,  # database 不在 server 场景里启用，避免单例冲突
+            None,
             deps.rate_limiter,
             deps.retry_handler,
             deps.queue_manager,
             progress_reporter=None,
         )
         if downloader is None:
-            raise RuntimeError(f"No downloader for url_type={parsed['type']}")
+            raise RuntimeError("No downloader for url_type=%s" % parsed["type"])
 
         result = await downloader.download(parsed)
         return {
@@ -106,6 +341,7 @@ async def _execute_download(url: str, deps: "_ServerDeps") -> Dict[str, int]:
 
 def build_app(config: ConfigLoader) -> FastAPI:
     deps = _ServerDeps(config)
+    api_key = _get_api_key(config)
 
     async def executor(url: str) -> Dict[str, int]:
         return await _execute_download(url, deps)
@@ -129,16 +365,50 @@ def build_app(config: ConfigLoader) -> FastAPI:
 
     app = FastAPI(
         title="Douyin Downloader API",
-        version="1.0",
-        description="REST API for dispatching Douyin download jobs.",
+        version="2.0",
+        description="REST API for resolving Douyin media URLs and dispatching download jobs.",
         lifespan=lifespan,
     )
     app.state.job_manager = manager
     app.state.deps = deps
+    app.state.api_key = api_key
+
+    # --- API key auth middleware ---
+    @app.middleware("http")
+    async def api_key_middleware(request: Request, call_next):
+        if api_key is None:
+            return await call_next(request)
+        path = request.url.path
+        if path in _PUBLIC_PATHS:
+            return await call_next(request)
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header == "Bearer %s" % api_key:
+            return await call_next(request)
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "unauthorized"},
+        )
+
+    # --- Endpoints ---
 
     @app.get("/api/v1/health")
     async def health() -> Dict[str, str]:
         return {"status": "ok"}
+
+    @app.post("/api/v1/resolve")
+    async def resolve(req: DownloadRequest) -> Dict[str, Any]:
+        """Resolve a Douyin URL into direct no-watermark media URLs.
+
+        Designed for iPhone Shortcuts: POST a Douyin URL, get back the
+        direct CDN link(s) which can be saved to Photos directly.
+        """
+        if not req.url:
+            raise HTTPException(status_code=400, detail="url is required")
+        try:
+            result = await _resolve_media_urls(req.url, deps)
+            return {"status": "success", **result}
+        except RuntimeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
 
     @app.post("/api/v1/download", response_model=JobResponse)
     async def create_job(req: DownloadRequest) -> JobResponse:

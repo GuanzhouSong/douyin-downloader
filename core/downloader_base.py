@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import re
 from abc import ABC, abstractmethod
@@ -35,6 +37,7 @@ class DownloadResult:
         self.success = 0
         self.failed = 0
         self.skipped = 0
+        self.downloaded_files = []  # type: List[Path]
 
     def __str__(self):
         return f"Total: {self.total}, Success: {self.success}, Failed: {self.failed}, Skipped: {self.skipped}"
@@ -67,7 +70,8 @@ class BaseDownloader(ABC):
         self.transcript_manager = TranscriptManager(
             self.config, self.file_manager, self.database
         )
-        self._local_aweme_ids: Optional[set[str]] = None
+        self._collected_files = []  # type: List[Path]
+        self._local_aweme_ids = None  # type: Optional[set]
         self._aweme_id_pattern = re.compile(r"(?<!\d)(\d{15,20})(?!\d)")
         self._local_media_suffixes = {
             ".mp4",
@@ -459,6 +463,7 @@ class BaseDownloader(ABC):
                 )
 
         self._mark_local_aweme_downloaded(aweme_id)
+        self._collected_files.extend(downloaded_files)
         logger.info("Downloaded %s: %s (%s)", media_type, desc, aweme_id)
         return True
 
